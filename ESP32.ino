@@ -3,7 +3,16 @@
 #include <vector>
 #include <algorithm>
 
+extern "C" {
+  #include "esp_wifi.h"
+}
+
 TFT_eSPI tft = TFT_eSPI();
+
+// =======================
+// LED PIN (single red, active-LOW)
+// =======================
+#define LED_PIN 4    // LOW = ON, HIGH = OFF
 
 // =======================
 // AP RECORD STRUCT
@@ -27,61 +36,95 @@ TaskHandle_t displayTaskHandle;
 
 bool newScanReady = false;
 
-// Convert WiFi channel → frequency MHz
+// =======================
+// HELPERS
+// =======================
 int chanToFreq(int ch) {
   return 2407 + (ch * 5);
 }
 
-// =======================
-// RSSI COLOR FUNCTION
-// =======================
-uint16_t rssiColor(int rssi) {
-  if (rssi >= -67)   return TFT_GREEN;          // Excellent–Good
-  if (rssi >= -70)   return TFT_YELLOW;         // Fair
-  if (rssi >= -80)   return TFT_RED;            // Poor
-  if (rssi >= -90)   return 0x7800;             // Burgundy (RGB565)
-  return TFT_BLACK;                              // Dead
+// Convert MAC to string
+String macToString(const uint8_t *mac) {
+  char buf[18];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
 }
 
-// =======================
-// WIFI SCAN TASK (CORE 0)
-// =======================
+// RSSI → color
+uint16_t rssiColor(int rssi) {
+  if (rssi >= -67) return TFT_GREEN;   // Excellent/Good
+  if (rssi >= -70) return TFT_YELLOW;  // Fair
+  if (rssi >= -80) return TFT_RED;     // Poor
+  return 0x7800;                       // Very poor (burgundy)
+}
+
+// ===============================
+// FAST WIFI SCAN TASK (CORE 0)
+// ===============================
 void wifiScanTask(void *param) {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
+  // Configure fast active scan
+  wifi_scan_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+  cfg.show_hidden = true;              // we filter hidden later
+  cfg.scan_time.active.min = 40;       // ~40 ms per channel
+  cfg.scan_time.active.max = 60;       // ~60 ms per channel
+
   for (;;) {
-    int count = WiFi.scanNetworks(false, true);
 
-    aps.clear();
-    aps.reserve(count);
+    // LED OFF during scan (active-LOW)
+    digitalWrite(LED_PIN, HIGH);
 
-    for (int i = 0; i < count; i++) {
+    // Start scan (blocking until done)
+    esp_wifi_scan_start(&cfg, true);
 
-      // ===== Skip Hidden SSIDs =====
-      String name = WiFi.SSID(i);
-      if (name.length() == 0) {
-        continue;
-      }
+    // Get AP count
+    uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
 
-      APRecord ap;
-      ap.ssid    = name;
-      ap.bssid   = WiFi.BSSIDstr(i);
-      ap.rssi    = WiFi.RSSI(i);
-      ap.channel = WiFi.channel(i);
-      ap.freq    = chanToFreq(ap.channel);
-
-      aps.push_back(ap);
+    wifi_ap_record_t *list = nullptr;
+    if (count > 0) {
+      list = (wifi_ap_record_t *)malloc(count * sizeof(wifi_ap_record_t));
     }
 
-    // Sort strongest → weakest
+    if (list && count > 0) {
+      esp_wifi_scan_get_ap_records(&count, list);
+
+      aps.clear();
+      aps.reserve(count);
+
+      for (int i = 0; i < count; i++) {
+        // Skip hidden SSID
+        if (strlen((char*)list[i].ssid) == 0) continue;
+
+        APRecord ap;
+        ap.ssid    = String((char*)list[i].ssid);
+        ap.bssid   = macToString(list[i].bssid);
+        ap.rssi    = list[i].rssi;
+        ap.channel = list[i].primary;
+        ap.freq    = chanToFreq(ap.channel);
+
+        aps.push_back(ap);
+      }
+
+      free(list);
+    } else {
+      aps.clear();
+      if (list) free(list);
+    }
+
+    // Sort strongest first
     std::sort(aps.begin(), aps.end(),
       [](const APRecord &a, const APRecord &b) {
         return a.rssi > b.rssi;
       });
 
-    // ===== SERIAL OUTPUT =====
-    Serial.println("\n===== WiFi Scan (Visible SSIDs Only) =====");
+    // Serial output
+    Serial.println("\n===== FAST WiFi Scan (target ~1s interval) =====");
     for (auto &ap : aps) {
       Serial.printf(
         "%s  %ddBm  CH%d  %dMHz  %s\n",
@@ -93,14 +136,21 @@ void wifiScanTask(void *param) {
       );
     }
 
+    // Blink LED once to indicate scan complete (active-LOW)
+    digitalWrite(LED_PIN, LOW);                 // ON
+    vTaskDelay(60 / portTICK_PERIOD_MS);
+    digitalWrite(LED_PIN, HIGH);                // OFF
+
     newScanReady = true;
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
+
+    // Top-up delay to ~1s total loop time
+    vTaskDelay(700 / portTICK_PERIOD_MS);
   }
 }
 
-// =======================
-// DRAW ONE CARD (COLOR)
-// =======================
+// ===============================
+// DRAW CARD
+// ===============================
 void drawCard(const APRecord &ap, int y) {
   tft.fillRect(0, y, 320, 52, TFT_BLACK);
 
@@ -111,16 +161,13 @@ void drawCard(const APRecord &ap, int y) {
   tft.setCursor(4, y + 20);
   tft.printf("BSSID: %s", ap.bssid.c_str());
 
-  // ===== RSSI BAR COLOR =====
   uint16_t col = rssiColor(ap.rssi);
-
   int bar = map(ap.rssi, -90, -20, 10, 300);
   bar = constrain(bar, 10, 300);
 
   tft.fillRect(4, y + 38, bar, 8, col);
   tft.drawRect(4, y + 38, 300, 8, TFT_WHITE);
 
-  // Right side text using same color
   tft.setTextColor(col, TFT_BLACK);
   tft.setCursor(240, y + 4);
   tft.printf("%ddBm", ap.rssi);
@@ -130,13 +177,12 @@ void drawCard(const APRecord &ap, int y) {
   tft.printf("CH%d", ap.channel);
 }
 
-// =======================
+// ===============================
 // DISPLAY TASK (CORE 1)
-// Smooth Diff-Based Update
-// =======================
+// ===============================
 void displayTask(void *param) {
   const int cardHeight = 52;
-  const int maxCards   = 8;
+  const int maxCards   = 9;
 
   for (;;) {
     if (newScanReady) {
@@ -176,15 +222,17 @@ void displayTask(void *param) {
   }
 }
 
-// =======================
+// ===============================
 // SETUP
-// =======================
+// ===============================
 void setup() {
   Serial.begin(115200);
 
-  // Backlight ON
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);       // OFF (active-LOW)
+
   pinMode(27, OUTPUT);
-  digitalWrite(27, HIGH);
+  digitalWrite(27, HIGH);            // Backlight ON
 
   tft.init();
   tft.setRotation(0);
@@ -195,9 +243,10 @@ void setup() {
   xTaskCreatePinnedToCore(displayTask, "displayTask", 5000, NULL, 1, &displayTaskHandle, 1);
 }
 
-// =======================
-// LOOP (unused)
-// =======================
+// ===============================
+// LOOP
+// ===============================
 void loop() {
   vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
+
