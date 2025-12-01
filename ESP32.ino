@@ -33,6 +33,17 @@ int chanToFreq(int ch) {
 }
 
 // =======================
+// RSSI COLOR FUNCTION
+// =======================
+uint16_t rssiColor(int rssi) {
+  if (rssi >= -67)   return TFT_GREEN;          // Excellent–Good
+  if (rssi >= -70)   return TFT_YELLOW;         // Fair
+  if (rssi >= -80)   return TFT_RED;            // Poor
+  if (rssi >= -90)   return 0x7800;             // Burgundy (RGB565)
+  return TFT_BLACK;                              // Dead
+}
+
+// =======================
 // WIFI SCAN TASK (CORE 0)
 // =======================
 void wifiScanTask(void *param) {
@@ -69,7 +80,7 @@ void wifiScanTask(void *param) {
         return a.rssi > b.rssi;
       });
 
-    // ===== SERIAL OUTPUT (one line per AP) =====
+    // ===== SERIAL OUTPUT =====
     Serial.println("\n===== WiFi Scan (Visible SSIDs Only) =====");
     for (auto &ap : aps) {
       Serial.printf(
@@ -88,7 +99,7 @@ void wifiScanTask(void *param) {
 }
 
 // =======================
-// DISPLAY: DRAW ONE CARD
+// DRAW ONE CARD (COLOR)
 // =======================
 void drawCard(const APRecord &ap, int y) {
   tft.fillRect(0, y, 320, 52, TFT_BLACK);
@@ -100,17 +111,22 @@ void drawCard(const APRecord &ap, int y) {
   tft.setCursor(4, y + 20);
   tft.printf("BSSID: %s", ap.bssid.c_str());
 
-  // RSSI bar
+  // ===== RSSI BAR COLOR =====
+  uint16_t col = rssiColor(ap.rssi);
+
   int bar = map(ap.rssi, -90, -20, 10, 300);
   bar = constrain(bar, 10, 300);
 
-  tft.fillRect(4, y + 38, bar, 8, TFT_GREEN);
+  tft.fillRect(4, y + 38, bar, 8, col);
   tft.drawRect(4, y + 38, 300, 8, TFT_WHITE);
 
+  // Right side text using same color
+  tft.setTextColor(col, TFT_BLACK);
   tft.setCursor(240, y + 4);
   tft.printf("%ddBm", ap.rssi);
 
   tft.setCursor(240, y + 20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.printf("CH%d", ap.channel);
 }
 
@@ -126,7 +142,6 @@ void displayTask(void *param) {
     if (newScanReady) {
       newScanReady = false;
 
-      // Diff-based update for smooth display
       for (int i = 0; i < maxCards; i++) {
         bool needRedraw = false;
 
@@ -176,7 +191,6 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1);
 
-  // Create tasks pinned to cores
   xTaskCreatePinnedToCore(wifiScanTask, "wifiTask", 6000, NULL, 1, &wifiTaskHandle, 0);
   xTaskCreatePinnedToCore(displayTask, "displayTask", 5000, NULL, 1, &displayTaskHandle, 1);
 }
